@@ -6,6 +6,7 @@
 #include "onedrive_provider.h"
 #include "s3_provider.h"
 #include "r2_provider.h"
+#include "feraxia_provider.h"
 #include "cloud_metadata_paths.h"
 #include "cloud_staging.h"
 #include "file_util.h"
@@ -3155,6 +3156,9 @@ std::unique_ptr<ICloudProvider> CreateCloudProvider(const std::string& name) {
     if (lower == "s3") {
         return std::make_unique<S3Provider>();
     }
+    if (lower == "feraxia") {
+        return std::make_unique<FeraxiaProvider>();
+    }
     // Wire the auth-failure callback at construction so CloudProviderBase
     // doesn't reverse-depend on CloudStorage.
     auto wireAuthCallback = [](std::unique_ptr<CloudProviderBase> p)
@@ -3199,6 +3203,7 @@ std::string ResolveProviderTokenPath(const std::string& configDir,
     //    explicit token_paths entry. Windows and Linux use different names.
     if (provider == "r2")       return configDir + "r2_credentials.json";
     if (provider == "s3")       return configDir + "s3_credentials.json";
+    if (provider == "feraxia")  return configDir + "feraxia_credentials.json";
 #ifdef _WIN32
     if (provider == "gdrive")   return configDir + "google_tokens.json";
     if (provider == "onedrive") return configDir + "onedrive_tokens.json";

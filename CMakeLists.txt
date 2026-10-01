@@ -96,6 +96,7 @@ set(PROVIDER_SOURCES
     src/providers/local_disk_provider.cpp
     src/providers/s3_provider.cpp
     src/providers/r2_provider.cpp
+    src/providers/feraxia_provider.cpp
 )
 
 if(WIN32)
