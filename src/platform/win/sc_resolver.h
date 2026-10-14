@@ -43,6 +43,7 @@ struct ResolvedAddrs {
     uintptr_t pbMsgCtor;                  // CProtoBufMsgBase::ctor
     uintptr_t pbMsgFinalize;              // CProtoBufMsgBase::finalize (allocate typed body)
     uintptr_t pbMsgCleanup;              // CProtoBufMsgBase::cleanup (dtor)
+    bool      pbMsgLayoutV2;              // CProtoBufMsg members shifted (Steam >= 1791918634)
     uintptr_t yieldIfTimeSlice;           // CJob::BYieldIfTimeSlice
 
     // ── Schema fetch ─────────────────────────────────────────────────

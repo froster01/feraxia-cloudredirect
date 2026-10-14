@@ -100,29 +100,31 @@ static uintptr_t ResolveServiceTransportVtable() {
 // The CAppInfoCache approach is more generic and doesn't depend on any
 // single function existing.
 
-static uintptr_t ResolveGlobalEngine(uintptr_t scBase) {
-    // Strategy A: scan for `lea rcx, [reg+0xE68]` pattern (CAppInfoCache offset)
-    // Pattern bytes: 48 8D 89 68 0E 00 00 (lea rcx,[rcx+0xE68])
-    //           or:  48 8D 8B 68 0E 00 00 (lea rcx,[rbx+0xE68])
-    // ModR/M byte 89=rcx+rcx, 8B=rcx+rbx, 8F=rcx+rdi, 8E=rcx+rsi
-    // We use wildcard on the ModR/M to catch any source register:
-    //   48 8D ?? 68 0E 00 00  where byte[2] & 0xC7 == 0x81 (disp32 + base reg)
-    // Actually simpler: the 4-byte immediate 68 0E 00 00 (=0xE68) is distinctive.
+// The CAppInfoCache offset inside CSteamEngine differs between Steam builds
+// (0xE68 up to build 1788652215, 0x1208 from build 1791918634). Every
+// candidate is scanned; the engine global is the pointer most often loaded
+// right before `lea reg, [reg + offset]`, which rejects stray matches.
+static constexpr int32_t kAppInfoCacheOffsets[] = { 0xE68, 0x1208 };
 
-    // Scan for any `lea reg, [reg + 0x00000E68]` -- 7-byte form with disp32
-    // The full pattern is: REX 8D ModRM disp32
-    // REX = 48 or 4C; opcode = 8D; ModRM & 0xC0 == 0x80 (mod=10 = disp32)
-    // and disp = 0x00000E68.
+static uintptr_t ResolveGlobalEngine(uintptr_t scBase, uint32_t* outAppInfoCacheOffset) {
     const auto* text = reinterpret_cast<const uint8_t*>(SigScanner::GetTextBase());
     size_t textSize = SigScanner::GetTextSize();
 
-    __try {
-        for (size_t i = 0; i + 7 <= textSize; ++i) {
-            if ((text[i] == 0x48 || text[i] == 0x4C) && text[i+1] == 0x8D &&
-                (text[i+2] & 0xC0) == 0x80) {
-                // Check disp32 == 0xE68
+    uintptr_t bestGlobal = 0;
+    int32_t bestOffset = 0;
+    int bestCount = 0;
+
+    for (int32_t wanted : kAppInfoCacheOffsets) {
+        struct Hit { uintptr_t global; int count; } hits[16] = {};
+        int nHits = 0;
+        __try {
+            // `lea reg, [reg + disp32]`: REX 8D ModRM(mod=10) disp32
+            for (size_t i = 0; i + 7 <= textSize; ++i) {
+                if ((text[i] != 0x48 && text[i] != 0x4C) || text[i+1] != 0x8D ||
+                    (text[i+2] & 0xC0) != 0x80)
+                    continue;
                 int32_t disp = *reinterpret_cast<const int32_t*>(text + i + 3);
-                if (disp != 0xE68) continue;
+                if (disp != wanted) continue;
 
                 uintptr_t leaAddr = SigScanner::GetTextBase() + i;
 
@@ -133,15 +135,32 @@ static uintptr_t ResolveGlobalEngine(uintptr_t scBase) {
                     uintptr_t global = SigScanner::DecodeRipRelMov(candidate);
                     if (global && global >= SigScanner::GetDataBase() &&
                         global < SigScanner::GetDataBase() + SigScanner::GetDataSize()) {
-                        LOG("[Resolver] GlobalEngine @ %p (RVA 0x%llX) via lea+0xE68 backwalk",
-                            (void*)global, (uint64_t)(global - scBase));
-                        return global;
+                        bool found = false;
+                        for (int k = 0; k < nHits; ++k) {
+                            if (hits[k].global == global) { ++hits[k].count; found = true; break; }
+                        }
+                        if (!found && nHits < 16) { hits[nHits].global = global; hits[nHits].count = 1; ++nHits; }
+                        break;
                     }
                 }
-                // Try next lea+0xE68 occurrence if backwalk failed
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+        for (int k = 0; k < nHits; ++k) {
+            if (hits[k].count > bestCount) {
+                bestCount = hits[k].count;
+                bestGlobal = hits[k].global;
+                bestOffset = wanted;
             }
         }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+
+    if (bestGlobal) {
+        LOG("[Resolver] GlobalEngine @ %p (RVA 0x%llX) via lea+0x%X backwalk (%d hits)",
+            (void*)bestGlobal, (uint64_t)(bestGlobal - scBase), (unsigned)bestOffset, bestCount);
+        if (outAppInfoCacheOffset) *outAppInfoCacheOffset = (uint32_t)bestOffset;
+        return bestGlobal;
+    }
 
     LOG("[Resolver] GlobalEngine: all strategies failed");
     return 0;
@@ -160,6 +179,40 @@ static uintptr_t ResolveGlobalEngine(uintptr_t scBase) {
 // function prologue within ~0x500 bytes that matches ParseFromArray's shape:
 //   48 89 5C 24 10 48 89 74 24 18 55 57 41 56 48 8D 6C 24 B9 48 81 EC A0 00 00 00
 //   The `sub rsp, A0h` and `lea rbp,[rsp-47h]` combo is distinctive.
+
+// CProtoBufMsg member layout: Steam build 1791918634 inserted a field at +0x24,
+// moving the body/header/EMsg members. The base constructor stores its third
+// argument (`mov [reg+disp8], r8d`) next to the vtable LEA; that displacement is
+// 0x38 on the old layout and 0x40 on the new one.
+static bool DetectPbMsgLayoutV2() {
+    uintptr_t vt = SigScanner::ResolveVtableByRtti(".?AVCProtoBufMsgBase@@");
+    if (!vt) return false;
+    const uintptr_t textBase = SigScanner::GetTextBase();
+    const auto* text = reinterpret_cast<const uint8_t*>(textBase);
+    const size_t textSize = SigScanner::GetTextSize();
+    bool result = false;
+    __try {
+        for (size_t i = 0x20; i + 0x80 <= textSize; ++i) {
+            if (text[i] != 0x48 || text[i+1] != 0x8D || text[i+2] != 0x05) continue;
+            int32_t disp = *reinterpret_cast<const int32_t*>(text + i + 3);
+            if (textBase + i + 7 + disp != vt) continue;
+            for (size_t k = i - 0x20; k < i + 0x60; ++k) {
+                if (text[k] != 0x44 || text[k+1] != 0x89) continue;
+                uint8_t modrm = text[k+2];
+                if ((modrm & 0xC0) != 0x40 || (modrm & 0x38) != 0) continue; // [reg+disp8], r8d
+                uint8_t d = text[k+3];
+                if (d == 0x38 || d == 0x40) {
+                    result = (d == 0x40);
+                    LOG("[Resolver] CProtoBufMsg layout %s (ctor stores r8d at +0x%X)",
+                        result ? "V2" : "V1", (unsigned)d);
+                    return result;
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    LOG("[Resolver] CProtoBufMsg layout: constructor not found, assuming V1");
+    return false;
+}
 
 static uintptr_t ResolveSerializeToArray() {
     // Prologue saves + sub rsp (wildcard) + cookie xor (48 33 C4).
@@ -606,7 +659,8 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
     r.serviceTransportVtable = ResolveServiceTransportVtable();
 
     // Phase 2: Global engine pointer
-    r.globalEngine = ResolveGlobalEngine(steamClientBase);
+    uint32_t appInfoCacheOffset = 0xE68;
+    r.globalEngine = ResolveGlobalEngine(steamClientBase, &appInfoCacheOffset);
 
     // Phase 3: Protobuf helpers (signature-based)
     r.serializeToArray = ResolveSerializeToArray();
@@ -1013,7 +1067,9 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
     r.engineOffUserMap      = 0;
     r.ccmOffConnContext     = 0;
     r.userOffCcmInterface   = 0;
-    r.engineOffAppInfoCache = 0xE68;
+    r.engineOffAppInfoCache = appInfoCacheOffset;
+
+    r.pbMsgLayoutV2 = DetectPbMsgLayoutV2();
 
     LOG("[Resolver] === Auto-resolution complete ===");
     return r;
