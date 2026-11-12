@@ -101,68 +101,85 @@ static uintptr_t ResolveServiceTransportVtable() {
 // single function existing.
 
 // The CAppInfoCache offset inside CSteamEngine differs between Steam builds
-// (0xE68 up to build 1788652215, 0x1208 from build 1791918634). Every
-// candidate is scanned; the engine global is the pointer most often loaded
-// right before `lea reg, [reg + offset]`, which rejects stray matches.
-static constexpr int32_t kAppInfoCacheOffsets[] = { 0xE68, 0x1208 };
+// (0xE68 up to build 1788652215, 0x1208 from build 1791918634, 0x1290 from
+// build 1794424036). Rather than listing offsets, every `mov reg, [rip+global]`
+// followed by `lea reg, [reg + disp32]` votes for its (global, disp) pair. The
+// engine's CAppInfoCache is by far the most common pair (~340 hits against ~23
+// for the runner-up on every known build); a weak or ambiguous winner is rejected.
+static constexpr int32_t kEngineMemberMin = 0x400;
+static constexpr int32_t kEngineMemberMax = 0x4000;
+static constexpr int kEngineMinHits = 100;
+static constexpr int kEngineMinMargin = 4;   // winner needs 4x the runner-up's hits
+
+struct EngineVote { uintptr_t global; int32_t disp; int count; };
+static constexpr size_t kEngineVoteSlots = 1 << 16;
+static EngineVote s_engineVotes[kEngineVoteSlots];
+
+static void AddEngineVote(uintptr_t global, int32_t disp) {
+    size_t h = (size_t)(((uint64_t)global * 0x9E3779B97F4A7C15ull) ^ (uint64_t)(uint32_t)disp);
+    for (size_t probe = 0; probe < kEngineVoteSlots; ++probe) {
+        EngineVote& v = s_engineVotes[(h + probe) & (kEngineVoteSlots - 1)];
+        if (v.count == 0) { v.global = global; v.disp = disp; v.count = 1; return; }
+        if (v.global == global && v.disp == disp) { ++v.count; return; }
+    }
+}
 
 static uintptr_t ResolveGlobalEngine(uintptr_t scBase, uint32_t* outAppInfoCacheOffset) {
     const auto* text = reinterpret_cast<const uint8_t*>(SigScanner::GetTextBase());
     size_t textSize = SigScanner::GetTextSize();
+    memset(s_engineVotes, 0, sizeof(s_engineVotes));
 
-    uintptr_t bestGlobal = 0;
-    int32_t bestOffset = 0;
-    int bestCount = 0;
+    __try {
+        // `lea reg, [reg + disp32]`: REX 8D ModRM(mod=10) disp32
+        for (size_t i = 0; i + 7 <= textSize; ++i) {
+            if ((text[i] != 0x48 && text[i] != 0x4C) || text[i+1] != 0x8D ||
+                (text[i+2] & 0xC0) != 0x80)
+                continue;
+            int32_t disp = *reinterpret_cast<const int32_t*>(text + i + 3);
+            if (disp < kEngineMemberMin || disp > kEngineMemberMax) continue;
 
-    for (int32_t wanted : kAppInfoCacheOffsets) {
-        struct Hit { uintptr_t global; int count; } hits[16] = {};
-        int nHits = 0;
-        __try {
-            // `lea reg, [reg + disp32]`: REX 8D ModRM(mod=10) disp32
-            for (size_t i = 0; i + 7 <= textSize; ++i) {
-                if ((text[i] != 0x48 && text[i] != 0x4C) || text[i+1] != 0x8D ||
-                    (text[i+2] & 0xC0) != 0x80)
-                    continue;
-                int32_t disp = *reinterpret_cast<const int32_t*>(text + i + 3);
-                if (disp != wanted) continue;
+            uintptr_t leaAddr = SigScanner::GetTextBase() + i;
 
-                uintptr_t leaAddr = SigScanner::GetTextBase() + i;
-
-                // Walk backward up to 40 bytes looking for `mov reg, [rip+disp]`
-                for (int back = 7; back <= 40; ++back) {
-                    uintptr_t candidate = leaAddr - back;
-                    if (candidate < SigScanner::GetTextBase()) break;
-                    uintptr_t global = SigScanner::DecodeRipRelMov(candidate);
-                    if (global && global >= SigScanner::GetDataBase() &&
-                        global < SigScanner::GetDataBase() + SigScanner::GetDataSize()) {
-                        bool found = false;
-                        for (int k = 0; k < nHits; ++k) {
-                            if (hits[k].global == global) { ++hits[k].count; found = true; break; }
-                        }
-                        if (!found && nHits < 16) { hits[nHits].global = global; hits[nHits].count = 1; ++nHits; }
-                        break;
-                    }
+            // Walk backward up to 40 bytes looking for `mov reg, [rip+disp]`
+            for (int back = 7; back <= 40; ++back) {
+                uintptr_t candidate = leaAddr - back;
+                if (candidate < SigScanner::GetTextBase()) break;
+                uintptr_t global = SigScanner::DecodeRipRelMov(candidate);
+                if (global && global >= SigScanner::GetDataBase() &&
+                    global < SigScanner::GetDataBase() + SigScanner::GetDataSize()) {
+                    AddEngineVote(global, disp);
+                    break;
                 }
             }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
 
-        for (int k = 0; k < nHits; ++k) {
-            if (hits[k].count > bestCount) {
-                bestCount = hits[k].count;
-                bestGlobal = hits[k].global;
-                bestOffset = wanted;
-            }
+    const EngineVote* best = nullptr;
+    int secondCount = 0;
+    for (size_t k = 0; k < kEngineVoteSlots; ++k) {
+        const EngineVote& v = s_engineVotes[k];
+        if (v.count == 0) continue;
+        if (!best || v.count > best->count) {
+            if (best) secondCount = best->count;
+            best = &v;
+        } else if (v.count > secondCount) {
+            secondCount = v.count;
         }
     }
 
-    if (bestGlobal) {
-        LOG("[Resolver] GlobalEngine @ %p (RVA 0x%llX) via lea+0x%X backwalk (%d hits)",
-            (void*)bestGlobal, (uint64_t)(bestGlobal - scBase), (unsigned)bestOffset, bestCount);
-        if (outAppInfoCacheOffset) *outAppInfoCacheOffset = (uint32_t)bestOffset;
-        return bestGlobal;
+    if (best && best->count >= kEngineMinHits && best->count >= secondCount * kEngineMinMargin) {
+        LOG("[Resolver] GlobalEngine @ %p (RVA 0x%llX) via lea+0x%X backwalk (%d hits, runner-up %d)",
+            (void*)best->global, (uint64_t)(best->global - scBase), (unsigned)best->disp,
+            best->count, secondCount);
+        if (outAppInfoCacheOffset) *outAppInfoCacheOffset = (uint32_t)best->disp;
+        return best->global;
     }
 
-    LOG("[Resolver] GlobalEngine: all strategies failed");
+    if (best)
+        LOG("[Resolver] GlobalEngine: ambiguous vote (lea+0x%X %d hits, runner-up %d); not resolved",
+            (unsigned)best->disp, best->count, secondCount);
+    else
+        LOG("[Resolver] GlobalEngine: all strategies failed");
     return 0;
 }
 
@@ -508,7 +525,90 @@ static uintptr_t ResolveKvGetUint64(uintptr_t /*kvFindKeyAddr*/) {
 // ── GetAppInfo, GetSection, ReadConfigU64 ─────────────────────────────
 // GetAppInfo has a distinctive prologue: mov r8d,[rcx+68h]; mov r9d,edx; cmp r8d,0FFFFFFFFh
 //   44 8B 41 68  44 8B CA  41 83 F8 FF
-static uintptr_t ResolveGetAppInfo() {
+// The tree members move with CAppInfoCache's layout: root/nodes/fallback node are
+// +0x68/+0x80/+0x50 up to build 1792618285 and +0x28/+0x40/+0x10 from 1794424036.
+
+// The CAppInfoCache ReadConfig* overloads (ReadConfigU64 among them) share this
+// prologue, then call GetAppInfo at +0x10 and GetSection a little later.
+static const uint8_t kReadConfigPat[] = {
+    0x48, 0x89, 0x5C, 0x24, 0x08, // mov [rsp+8], rbx
+    0x57,                          // push rdi
+    0x48, 0x83, 0xEC, 0x20,        // sub rsp, 20h
+    0x49, 0x8B, 0xD9,             // mov rbx, r9
+    0x41, 0x8B, 0xF8,             // mov edi, r8d
+};
+static const char kReadConfigMask[] = "xxxxxxxxxxxxxxxx";
+static constexpr size_t kReadConfigBodyScan = 0x80;
+
+// True if `func` contains `opcode rel32` (E8 call / E9 jmp) to `target` within `len` bytes.
+static bool BranchesTo(uintptr_t func, size_t len, uint8_t opcode, uintptr_t target) {
+    if (!func || !target) return false;
+    __try {
+        const auto* p = reinterpret_cast<const uint8_t*>(func);
+        for (size_t i = 0; i + 5 <= len; ++i) {
+            if (p[i] == opcode &&
+                func + i + 5 + *reinterpret_cast<const int32_t*>(p + i + 1) == target)
+                return true;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return false;
+}
+
+// GetAppInfo's CUtlRBTree lookup on the cache, at any member offset X:
+//   mov r8d,[rcx+X]; mov r9d,edx; cmp r8d,-1; je short; mov r11,[rcx+X+18h]
+static bool IsAppInfoLookup(uintptr_t addr) {
+    if (!addr) return false;
+    __try {
+        const auto* p = reinterpret_cast<const uint8_t*>(addr);
+        if (p[0] != 0x44 || p[1] != 0x8B || p[2] != 0x41) return false;
+        static const uint8_t mid[] = { 0x44, 0x8B, 0xCA, 0x41, 0x83, 0xF8, 0xFF, 0x74 };
+        if (memcmp(p + 4, mid, sizeof(mid)) != 0) return false;
+        int32_t nodes = (int32_t)p[3] + 0x18;
+        const uint8_t* q = p + 13;
+        if (q[0] == 0x4C && q[1] == 0x8B && q[2] == 0x59) return nodes < 0x80 && q[3] == nodes;
+        if (q[0] == 0x4C && q[1] == 0x8B && q[2] == 0x99)
+            return *reinterpret_cast<const int32_t*>(q + 3) == nodes;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return false;
+}
+
+static uintptr_t ResolveGetAppInfo(uintptr_t getSectionAddr) {
+    // Primary: the call target shared by the ReadConfig* overloads that also call
+    // GetSection (another cache class reuses the prologue but not GetSection).
+    if (getSectionAddr) {
+        struct Vote { uintptr_t target; int count; } votes[8] = {};
+        int nVotes = 0;
+        uintptr_t pos = SigScanner::GetTextBase();
+        uintptr_t end = pos + SigScanner::GetTextSize();
+        while (pos < end) {
+            uintptr_t hit = SigScanner::FindPatternInRange(pos, end - pos, kReadConfigPat,
+                                                           kReadConfigMask, sizeof(kReadConfigPat));
+            if (!hit) break;
+            pos = hit + sizeof(kReadConfigPat);
+            uintptr_t target = 0;
+            __try {
+                const auto* p = reinterpret_cast<const uint8_t*>(hit + sizeof(kReadConfigPat));
+                if (p[0] == 0xE8)
+                    target = hit + sizeof(kReadConfigPat) + 5 + *reinterpret_cast<const int32_t*>(p + 1);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            if (!target || !IsAppInfoLookup(target) ||
+                !BranchesTo(hit, kReadConfigBodyScan, 0xE8, getSectionAddr))
+                continue;
+            int k = 0;
+            while (k < nVotes && votes[k].target != target) ++k;
+            if (k == nVotes && nVotes < 8) votes[nVotes++] = { target, 0 };
+            if (k < nVotes) ++votes[k].count;
+        }
+        if (nVotes == 1 && votes[0].count >= 2) {
+            LOG("[Resolver] GetAppInfo @ %p (RVA 0x%llX) via ReadConfig callers (%d)",
+                (void*)votes[0].target, (uint64_t)(votes[0].target - SigScanner::GetImageBase()),
+                votes[0].count);
+            return votes[0].target;
+        }
+        LOG("[Resolver] GetAppInfo: ReadConfig caller vote inconclusive (%d candidates)", nVotes);
+    }
+
+    // Fallback: exact prologue of builds up to 1792618285.
     static const uint8_t pat[] = {
         0x44, 0x8B, 0x41, 0x68,       // mov r8d, [rcx+68h]
         0x44, 0x8B, 0xCA,             // mov r9d, edx
@@ -517,11 +617,13 @@ static uintptr_t ResolveGetAppInfo() {
     static const char mask[] = "xxxxxxxxxxx";
 
     uintptr_t result = SigScanner::FindPattern(pat, mask, 11);
-    if (result)
+    if (result && IsAppInfoLookup(result))
         LOG("[Resolver] GetAppInfo @ %p (RVA 0x%llX) via signature",
             (void*)result, (uint64_t)(result - SigScanner::GetImageBase()));
-    else
+    else {
+        result = 0;
         LOG("[Resolver] GetAppInfo: signature not found");
+    }
     return result;
 }
 
@@ -544,45 +646,35 @@ static uintptr_t ResolveGetSection() {
     return result;
 }
 
-// ReadConfigU64: same prologue as an overload; take the last match after GetAppInfo.
-static uintptr_t ResolveReadConfigU64(uintptr_t getAppInfoAddr) {
-    static const uint8_t pat[] = {
-        0x48, 0x89, 0x5C, 0x24, 0x08, // mov [rsp+8], rbx
-        0x57,                          // push rdi
-        0x48, 0x83, 0xEC, 0x20,        // sub rsp, 20h
-        0x49, 0x8B, 0xD9,             // mov rbx, r9
-        0x41, 0x8B, 0xF8,             // mov edi, r8d
-    };
-    static const char mask[] = "xxxxxxxxxxxxxxxx";
-
-    if (!getAppInfoAddr) {
-        // Fall back to global scan (may hit the wrong overload, but still functional)
-        uintptr_t result = SigScanner::FindPattern(pat, mask, 16);
-        if (result)
-            LOG("[Resolver] ReadConfigU64 @ %p (RVA 0x%llX) via signature (no anchor)",
-                (void*)result, (uint64_t)(result - SigScanner::GetImageBase()));
-        else
-            LOG("[Resolver] ReadConfigU64: signature not found");
-        return result;
+// ReadConfigU64: the ReadConfig* overload near GetAppInfo that calls it and
+// tail-jumps to KvGetUint64 (its siblings end in KvGetInt etc.). Without both
+// anchors the overload cannot be told apart, so it is left unresolved; the
+// global-scan fallback picked the KvGetInt overload on build 1794424036.
+static uintptr_t ResolveReadConfigU64(uintptr_t getAppInfoAddr, uintptr_t kvGetUint64Addr) {
+    if (!getAppInfoAddr || !kvGetUint64Addr) {
+        LOG("[Resolver] ReadConfigU64: needs GetAppInfo and KvGetUint64; not resolved");
+        return 0;
     }
 
-    // Scan forward from GetAppInfo; take the last match in the window.
     uintptr_t scanStart = getAppInfoAddr + 0x80;
     size_t scanSize = 0x2000;
     uintptr_t result = 0;
     uintptr_t pos = scanStart;
     while (pos < scanStart + scanSize) {
         size_t remaining = scanStart + scanSize - pos;
-        uintptr_t hit = SigScanner::FindPatternInRange(pos, remaining, pat, mask, 16);
+        uintptr_t hit = SigScanner::FindPatternInRange(pos, remaining, kReadConfigPat,
+                                                       kReadConfigMask, sizeof(kReadConfigPat));
         if (!hit) break;
-        result = hit; // keep the last match
-        pos = hit + 16;
+        pos = hit + sizeof(kReadConfigPat);
+        if (BranchesTo(hit, kReadConfigBodyScan, 0xE8, getAppInfoAddr) &&
+            BranchesTo(hit, kReadConfigBodyScan, 0xE9, kvGetUint64Addr))
+            result = hit; // keep the last match
     }
     if (result)
-        LOG("[Resolver] ReadConfigU64 @ %p (RVA 0x%llX) via proximity to GetAppInfo",
+        LOG("[Resolver] ReadConfigU64 @ %p (RVA 0x%llX) via GetAppInfo call + KvGetUint64 tail jump",
             (void*)result, (uint64_t)(result - SigScanner::GetImageBase()));
     else
-        LOG("[Resolver] ReadConfigU64: not found near GetAppInfo");
+        LOG("[Resolver] ReadConfigU64: no overload near GetAppInfo tail-jumps to KvGetUint64");
     return result;
 }
 
@@ -659,7 +751,7 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
     r.serviceTransportVtable = ResolveServiceTransportVtable();
 
     // Phase 2: Global engine pointer
-    uint32_t appInfoCacheOffset = 0xE68;
+    uint32_t appInfoCacheOffset = 0;   // set only by a validated engine vote
     r.globalEngine = ResolveGlobalEngine(steamClientBase, &appInfoCacheOffset);
 
     // Phase 3: Protobuf helpers (signature-based)
@@ -738,9 +830,9 @@ ResolvedAddrs Resolve(uintptr_t steamClientBase) {
     r.kvSetString  = ResolveKvSetString();
 
     // Phase 9: AppInfo functions (signature-based, ReadConfigU64 anchored to GetAppInfo)
-    r.getAppInfo     = ResolveGetAppInfo();
     r.getSection     = ResolveGetSection();
-    r.readConfigU64  = ResolveReadConfigU64(r.getAppInfo);
+    r.getAppInfo     = ResolveGetAppInfo(r.getSection);
+    r.readConfigU64  = ResolveReadConfigU64(r.getAppInfo, r.kvGetUint64);
 
     // Phase 10: BAsyncSend (string xref — unique "CProtoBufMsg::BAsyncSend")
     r.bAsyncSend = ResolveFuncByStringXref(
